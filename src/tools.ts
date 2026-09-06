@@ -3,6 +3,7 @@ import { UnifiClient, UnifiError, MIN_CONNECTOR_FIRMWARE, type ConsoleSummary } 
 import { captureConfig, SECTIONS } from "./capture";
 import { diffSection, type ConsoleDiff } from "./diff";
 import { cachedJson } from "./cache";
+import { captureDevices, captureHealth, type DeviceState, type HealthState } from "./state";
 import type { NormalisedConfig, SectionName } from "./normalise";
 
 export interface ToolDef {
@@ -75,6 +76,9 @@ const SECTION_COST: Record<SectionName, number> = {
   dns: 4,
 };
 
+/** State calls are cheap: a site lookup plus one endpoint. */
+const STATE_COST = 3;
+
 /** Leaves headroom below the free plan's 50, since the count is an estimate. */
 const SUBREQUEST_BUDGET = 40;
 
@@ -112,6 +116,49 @@ async function batched<T>(
   settled.forEach((outcome, i) => {
     if (outcome.status === "fulfilled") results.push(outcome.value);
     // One unreachable console should not lose the answer for the other five.
+    else failures.push({ consoleId: batch[i], error: String(outcome.reason?.message ?? outcome.reason) });
+  });
+
+  return { results, failures, remaining };
+}
+
+/**
+ * Fans a per-console job across the fleet with a cost-aware cap. Shares the failure
+ * handling of the config batcher: one unreachable console must not lose the answer for
+ * the rest, which matters more here because state is what you check during an incident.
+ */
+async function fanOut<T>(
+  ctx: Ctx,
+  consoleIds: string[],
+  costPerConsole: number,
+  job: (id: string, summary: ConsoleSummary) => Promise<T>,
+): Promise<{ results: T[]; failures: { consoleId: string; error: string }[]; remaining: string[] }> {
+  const index = await consoleIndex(ctx);
+  const affordable = Math.max(1, Math.floor(SUBREQUEST_BUDGET / costPerConsole));
+  const limit = Math.min(maxBatch(ctx.env) * 2, affordable);
+
+  const batch = consoleIds.slice(0, limit);
+  const remaining = consoleIds.slice(limit);
+
+  const settled = await Promise.allSettled(
+    batch.map(async (id) => {
+      const summary = index.get(id);
+      if (!summary) throw new UnifiError(`Console ${id} is not visible to this API key.`, 404, id);
+      if (!summary.connectorCapable) {
+        throw new UnifiError(
+          `Console ${id} runs ${summary.osVersion}, below the ${MIN_CONNECTOR_FIRMWARE} needed for the Cloud Connector proxy.`,
+          412,
+          id,
+        );
+      }
+      return job(id, summary);
+    }),
+  );
+
+  const results: T[] = [];
+  const failures: { consoleId: string; error: string }[] = [];
+  settled.forEach((outcome, i) => {
+    if (outcome.status === "fulfilled") results.push(outcome.value);
     else failures.push({ consoleId: batch[i], error: String(outcome.reason?.message ?? outcome.reason) });
   });
 
@@ -229,6 +276,167 @@ const readTools: ToolDef[] = [
         note: remaining.length
           ? `${remaining.length} console(s) not yet checked. Call diff_config again with consoleIds set to 'remaining'.`
           : undefined,
+      };
+    },
+  },
+  {
+    name: "get_health",
+    description:
+      "Current operational health for one console: WAN availability and latency, ISP, client counts, device counts, and gateway CPU and memory. This is live state, not configuration. Use it to answer whether a site is healthy right now.",
+    inputSchema: {
+      type: "object",
+      properties: { consoleId: { type: "string" } },
+      required: ["consoleId"],
+    },
+    handler: async (args, ctx) => {
+      assertAllowed(ctx.env, [args.consoleId]);
+      const index = await consoleIndex(ctx);
+      const summary = index.get(args.consoleId);
+      if (!summary) throw new UnifiError(`Console ${args.consoleId} is not visible to this API key.`, 404, args.consoleId);
+      // Short TTL: this is live state, and a stale answer during an incident is worse
+      // than a slow one.
+      return cachedJson(ctx.apiKey, ["health", args.consoleId], 15, () =>
+        captureHealth(ctx.client, args.consoleId, summary.name),
+      );
+    },
+  },
+  {
+    name: "fleet_health",
+    description:
+      "Health across every reachable console at once, reduced to one comparable row per site. This is the fastest way to answer 'is anything wrong across my sites', which the UniFi interface cannot show in a single view. Consoles that cannot be reached are listed separately rather than failing the call.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        consoleIds: {
+          type: "array",
+          items: { type: "string" },
+          description: "Defaults to every console this key can reach.",
+        },
+      },
+    },
+    handler: async (args, ctx) => {
+      const index = await consoleIndex(ctx);
+      const allow = allowedConsoles(ctx.env);
+      const ids: string[] = args.consoleIds?.length
+        ? args.consoleIds
+        : [...index.keys()].filter((id) => !allow || allow.has(id));
+      assertAllowed(ctx.env, ids);
+
+      const { results, failures, remaining } = await fanOut<HealthState>(
+        ctx,
+        ids,
+        STATE_COST,
+        (id, summary) =>
+          cachedJson(ctx.apiKey, ["health", id], 15, () => captureHealth(ctx.client, id, summary.name)),
+      );
+
+      // Surfaced explicitly so the interesting sites do not have to be spotted by eye.
+      const attention = results
+        .filter(
+          (h) =>
+            h.status !== "ok" ||
+            h.devices.disconnected > 0 ||
+            h.devices.pending > 0 ||
+            (h.wans[0]?.availabilityPercent ?? 100) < 100,
+        )
+        .map((h) => h.consoleName);
+
+      return {
+        checked: results.length,
+        needsAttention: attention,
+        sites: results,
+        failures,
+        remaining,
+        note: remaining.length
+          ? `${remaining.length} console(s) not checked in this call. Pass them as consoleIds to continue.`
+          : undefined,
+      };
+    },
+  },
+  {
+    name: "list_devices",
+    description:
+      "Devices on one console with their model, firmware, connection state, client count and UniFi experience score. Reduced to the fields that matter for support, because the raw payload includes port and radio tables large enough to be unusable.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        consoleId: { type: "string" },
+        onlyProblems: {
+          type: "boolean",
+          description: "Return only devices that are disconnected, unadopted, upgradable, or scoring below 80.",
+        },
+      },
+      required: ["consoleId"],
+    },
+    handler: async (args, ctx) => {
+      assertAllowed(ctx.env, [args.consoleId]);
+      const devices = await cachedJson(ctx.apiKey, ["devices", args.consoleId], 30, () =>
+        captureDevices(ctx.client, args.consoleId),
+      );
+      const list = args.onlyProblems
+        ? devices.filter(
+            (d) => !d.connected || !d.adopted || d.upgradable || (d.satisfaction !== null && d.satisfaction < 80),
+          )
+        : devices;
+      return { count: list.length, totalOnSite: devices.length, devices: list };
+    },
+  },
+  {
+    name: "firmware_report",
+    description:
+      "Firmware across the fleet, showing which devices have updates pending and where versions differ between sites. Answers the patch compliance question in one call rather than one console at a time.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        consoleIds: { type: "array", items: { type: "string" }, description: "Defaults to all." },
+      },
+    },
+    handler: async (args, ctx) => {
+      const index = await consoleIndex(ctx);
+      const allow = allowedConsoles(ctx.env);
+      const ids: string[] = args.consoleIds?.length
+        ? args.consoleIds
+        : [...index.keys()].filter((id) => !allow || allow.has(id));
+      assertAllowed(ctx.env, ids);
+
+      const { results, failures, remaining } = await fanOut(ctx, ids, STATE_COST, async (id, summary) => {
+        const devices = await cachedJson(ctx.apiKey, ["devices", id], 30, () =>
+          captureDevices(ctx.client, id),
+        );
+        return { consoleId: id, consoleName: summary.name, devices };
+      });
+
+      // Grouped by model so "every UAP6MP is on a different version" is visible at a
+      // glance, which is the actual question behind a firmware audit.
+      const byModel = new Map<string, Set<string>>();
+      const pending: { site: string; device: string; model: string | null; version: string | null }[] = [];
+
+      for (const site of results) {
+        for (const d of (site.devices as DeviceState[])) {
+          if (d.model && d.version) {
+            const set = byModel.get(d.model) ?? new Set<string>();
+            set.add(d.version);
+            byModel.set(d.model, set);
+          }
+          if (d.upgradable) {
+            pending.push({ site: site.consoleName, device: d.name, model: d.model, version: d.version });
+          }
+        }
+      }
+
+      const versionSpread = [...byModel.entries()]
+        .map(([model, versions]) => ({ model, versions: [...versions].sort() }))
+        .filter((entry) => entry.versions.length > 1);
+
+      return {
+        sitesChecked: results.length,
+        updatesPending: pending,
+        modelsWithMixedVersions: versionSpread,
+        failures,
+        remaining,
+        note: pending.length
+          ? undefined
+          : "No devices report a pending update across the consoles checked.",
       };
     },
   },
