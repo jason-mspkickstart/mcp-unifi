@@ -20,16 +20,26 @@ not exist here.
 silently no-ops there: every write appears to succeed and every read misses. Put the Worker
 on a custom domain or accept that every call goes to UniFi.
 
+**Two different UniFi keys exist, and only one of them works here.** The key under a
+console's Settings, Control Plane, Integrations is local to that console. This server needs
+the account-level key from unifi.ui.com under Settings, API Keys. It is shown once, so
+copy it when you create it.
+
 ## Prerequisites
 
 - A Cloudflare account. The free plan is enough.
-- A UniFi API key from unifi.ui.com, under Settings, Control Plane, Integrations.
+- A UniFi **account-level** API key from unifi.ui.com, under Settings, API Keys. This is
+  not the same as the key under Settings, Control Plane, Integrations: that one is local to
+  a single console and cannot see a fleet. See the note below on which account to generate
+  it from.
 - Consoles running firmware 5.0.3 or later. Below that there is no Cloud Connector proxy
   and the console cannot be managed remotely at all. `list_consoles` tells you which of
   yours qualify.
-- For managing consoles you do not personally own, an **organisation** API key. A personal
-  key only reaches consoles belonging to its owner, which is the usual reason an MSP sees
-  a 403 on a client site.
+- For managing consoles you do not personally own, an **organisation** API key. Each key is
+  tied to the account or organisation that generated it, so a personal key only reaches
+  consoles belonging to its owner. Generating the key from your personal account instead of
+  the organisation that administers the client consoles is the usual reason an MSP sees a
+  403 on a client site.
 
 ## Deploy
 
