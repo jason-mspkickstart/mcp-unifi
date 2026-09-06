@@ -115,6 +115,44 @@ export class UnifiClient {
   }
 
   /**
+   * Rejects a proxy path that could escape the intended console prefix or redirect the
+   * request somewhere else.
+   *
+   * The path is concatenated into the connector URL, so without this a caller could walk
+   * out of /proxy with .. segments, or start a protocol-relative or absolute URL and have
+   * the request go to a host of their choosing. Encoded forms are caught too, because the
+   * cloud endpoint decodes before forwarding.
+   */
+  private static assertSafePath(path: string): void {
+    const reject = (reason: string): never => {
+      throw new UnifiError(`Rejected proxy path: ${reason}. Give a path relative to the console's /proxy prefix, for example /network/integration/v1/sites.`, 400);
+    };
+
+    if (!path.startsWith("/")) reject("it must begin with a single slash");
+    // Two leading slashes are read as protocol-relative and would change the host.
+    if (path.startsWith("//")) reject("a protocol-relative path would change the target host");
+    if (/^[a-z][a-z0-9+.-]*:/i.test(path)) reject("an absolute URL would change the target host");
+    if (path.includes("\\")) reject("backslashes are not allowed");
+    if (/[\s\x00-\x1f]/.test(path)) reject("whitespace and control characters are not allowed");
+
+    // Decode repeatedly, since a single decode still leaves %252e%252e as ..
+    let decoded = path;
+    for (let i = 0; i < 3; i++) {
+      let next: string;
+      try {
+        next = decodeURIComponent(decoded);
+      } catch {
+        reject("it contains a malformed percent-encoded sequence");
+        return;
+      }
+      if (next === decoded) break;
+      decoded = next;
+    }
+
+    if (decoded.split(/[/?#]/).includes("..")) reject("parent directory segments are not allowed");
+  }
+
+  /**
    * Cloud Connector proxy. Forwards to the console's own local API without needing a
    * VPN or an open port. The path is whatever the console serves under /proxy, which is
    * why both the official integration API and the classic API are reachable this way.
@@ -126,6 +164,7 @@ export class UnifiClient {
     body?: unknown,
   ): Promise<unknown> {
     const clean = proxyPath.startsWith("/") ? proxyPath : `/${proxyPath}`;
+    UnifiClient.assertSafePath(clean);
     return this.request(
       `${SITE_MANAGER_BASE}/connector/consoles/${encodeURIComponent(consoleId)}/proxy${clean}`,
       { method, body: body === undefined ? undefined : JSON.stringify(body) },
