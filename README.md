@@ -1,69 +1,53 @@
 # mcp-unifi
 
-An MCP server for [UniFi](https://ui.com), running on Cloudflare Workers. Manage a whole
-fleet of consoles through one connection instead of one controller at a time.
+An MCP server for [UniFi Site Manager](https://unifi.ui.com), running on Cloudflare
+Workers. Manage a fleet of UniFi consoles from an AI assistant, across every site at
+once.
 
-**Connect UniFi to Claude, Claude Code, Cursor or any MCP client.** No local install, no
-Node.js, no Python, no VPN into client networks. It runs as a remote Worker in your own
-Cloudflare account, so it works from mobile as well as desktop and keeps working when your
-laptop is closed.
+**Connect UniFi to Claude, Claude Code, Cursor or any MCP client.** No local install,
+no Node.js, no Python, no VPN. It runs as a remote Worker in your own Cloudflare
+account, reaching each console through UniFi's Cloud Connector proxy, so it works from
+mobile as well as desktop and keeps working when your laptop is closed.
 
-> "Which of my sites disagree with the standard firewall policy set?"
-> "Do all the guest networks have the same DNS servers and lease time?"
-> "Show me every console still running firmware too old to manage remotely."
+> "Is anything wrong across my sites?"
+> "Which devices have firmware updates pending?"
+> "Does the new site match how we build sites?"
+> "Which clients are having a bad time on WiFi at the pub?"
 
-Reads through the UniFi Site Manager Cloud Connector, so it reaches consoles you have no
-network path to.
-
-[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/jason-mspkickstart/mcp-unifi)
-
-One click clones this repo to your GitHub and deploys it to your own Cloudflare account.
-Your API key stays in your Worker, never anyone else's. Free on Cloudflare's free plan.
+Built for MSPs and anyone running more than one console. The UniFi interface shows you
+one site at a time; this shows you all of them in one answer.
 
 ---
 
 ## Contents
 
 - [Before you start](#before-you-start)
-- [Setup](#setup) — deploy, secrets, connect
+- [Setup](#setup)
 - [Connecting your AI assistant](#connecting-your-ai-assistant)
 - [Tools](#tools)
-- [How it works](#how-it-works)
 - [Configuration reference](#configuration-reference)
+- [How it works](#how-it-works)
 - [Troubleshooting](#troubleshooting)
-- [Why another UniFi MCP](#why-another-unifi-mcp)
 
 ---
 
 ## Before you start
 
-You need three things:
+You need:
 
-1. **Consoles running firmware 5.0.3 or later.** Below that there is no Cloud Connector
-proxy, so the console cannot be managed remotely at all and there is nothing this server
-can do about it. `list_consoles` tells you which of yours qualify.
-2. **A Cloudflare account.** The free plan is fine.
-3. **A UniFi API key.** See below.
+1. **A UniFi account with consoles adopted into it**, visible at
+   [unifi.ui.com](https://unifi.ui.com).
+2. **Console firmware 5.0.3 or later.** Below that there is no Cloud Connector proxy
+   and the console cannot be reached from the cloud at all.
+3. **A Site Manager API key.** At [unifi.ui.com](https://unifi.ui.com), open your
+   account settings and create an API key.
+4. **A Cloudflare account.** The free plan is fine.
 
-You do **not** need Node.js, a terminal, or any local tooling. Everything below can be done
-in a browser.
+**The key must come from unifi.ui.com**, not from an individual console's settings. A
+console-local key only works against that console's local API and will be rejected by
+`api.ui.com`. This is the most common setup mistake.
 
-### Getting a UniFi API key
-
-1. Sign in to the UniFi Site Manager at [unifi.ui.com](https://unifi.ui.com) and select the
-organisation that administers the consoles you want to manage.
-2. Go to **Settings** → **API Keys**.
-3. **Create New API Key**, and give it a name.
-4. Copy the key. It is shown once and never again.
-
-**The single most common mistake:** there are two different UniFi API keys, and only the
-one above works here. The key under a console's **Settings** → **Control Plane** →
-**Integrations** is local to that single console and cannot see a fleet. Using it does not
-produce a permissions error, it just returns nothing, which looks like a broken server.
-
-The second most common mistake is scoping. Each key is tied to the account or organisation
-that created it, so a personal key only reaches consoles you own yourself. If you manage
-client consoles, the key has to come from the organisation that administers them.
+You do **not** need Node.js or any local tooling. Everything below is done in a browser.
 
 ---
 
@@ -71,82 +55,55 @@ client consoles, the key has to come from the organisation that administers them
 
 ### 1. Deploy to Cloudflare
 
-Use the **Deploy to Cloudflare** button at the top of this README. It forks the repo to
-your GitHub account and sets the Worker up for you, then redeploys on every push.
-
-**Or set it up manually**
-
 Fork this repository, then in the Cloudflare dashboard go to **Compute (Workers)** →
 **Create** → **Import a repository**. Connect GitHub, choose your fork, and set:
 
-| Setting        | Value                 |
-| -------------- | --------------------- |
-| Branch         | `main`                |
-| Build command  | *leave empty*         |
+| Setting | Value |
+| --- | --- |
+| Branch | `main` |
+| Build command | *leave empty* |
 | Deploy command | `npx wrangler deploy` |
 
-Check it worked by visiting `https://mcp-unifi.<your-subdomain>.workers.dev/health` in a
-browser. It should say `ok`.
+Check `https://mcp-unifi.<your-subdomain>.workers.dev/health` returns `ok`.
 
-**Prefer the command line?**
+### 2. Generate an access token
 
-```
-npm install
-npx wrangler login
-npx wrangler deploy
-```
+PowerShell:
 
-### 2. Choose your mode
-
-**Private (recommended for MSP use).** Your UniFi key is stored in the Worker and a
-separate access token controls who can use it. Continue to step 3.
-
-**Bring your own key.** The Worker stores nothing, and each user sends their own UniFi key.
-Use this if you want to share the deployment with others. Skip step 3 entirely and jump to
-[Connecting](#connecting-your-ai-assistant), using your UniFi key as the header value.
-
-Think about this one properly. A UniFi key is not scoped to a single console, so private
-mode means whoever holds the token can read configuration across every console that key
-administers.
-
-### 3. Add your secrets
-
-Generate an access token first. In PowerShell:
-
-```
+```powershell
 -join ((1..32) | ForEach-Object { '{0:x2}' -f (Get-Random -Max 256) })
 ```
 
-Or on macOS and Linux:
+macOS or Linux:
 
-```
+```bash
 openssl rand -hex 32
 ```
 
-In the Cloudflare dashboard, open your Worker → **Settings** → **Variables and Secrets**.
-Add these, each as type **Secret** rather than plain text:
+### 3. Add your secrets
 
-| Name                | Value                                                          |
-| ------------------- | -------------------------------------------------------------- |
-| `UNIFI_API_KEY`     | Your UniFi Site Manager key                                    |
-| `MCP_TOKEN`         | The token you just generated                                   |
-| `ALLOWED_CONSOLES`  | *Optional.* Comma separated console IDs from `list_consoles`   |
+Cloudflare dashboard → your Worker → **Settings** → **Variables and Secrets**. Add each
+as type **Secret**, not Text:
 
-Setting `UNIFI_API_KEY` switches the Worker into private mode, where `MCP_TOKEN` is
-mandatory. The Worker refuses to serve anything if you set the key without a token, rather
-than quietly exposing your whole estate to anyone who finds the URL.
+| Name | Value |
+| --- | --- |
+| `UNIFI_API_KEY` | Your Site Manager API key |
+| `MCP_TOKEN` | The token from step 2 |
+| `ALLOWED_CONSOLES` | *Optional.* Comma separated console IDs to restrict this deployment |
 
-`ALLOWED_CONSOLES` is optional but worth setting. It restricts which consoles can be
-touched, and putting it in as a secret keeps your client list out of a public repository.
+**Check the names carefully.** They must match exactly. A secret named
+`UNIFI_API_TOKEN` will not bind, and the server will tell you so rather than failing in
+a confusing way.
+
+**Secret, not Text, matters.** Plain-text variables declared in `wrangler.toml` replace
+all dashboard variables on every deploy. Secrets survive.
 
 ### 4. Use a custom domain
 
-Not strictly required, but do it. **Settings** → **Domains & Routes** → **Add** → **Custom
-domain**, something like `mcp-unifi.yourdomain.com`.
+**Settings** → **Domains & Routes** → **Add** → **Custom domain**.
 
 Cloudflare's Cache API silently does nothing on `workers.dev` subdomains, so without a
-custom domain the response cache never works and every console read makes a fresh trip
-through the cloud proxy, at roughly 800ms each.
+custom domain no response caching happens at all and every call hits UniFi.
 
 ---
 
@@ -156,42 +113,34 @@ through the cloud proxy, at roughly 800ms each.
 
 **Settings** → **Connectors** → **Add custom connector**.
 
-| Field          | Value                                   |
-| -------------- | --------------------------------------- |
-| URL            | `https://mcp-unifi.yourdomain.com/mcp`  |
-| Authentication | **None**                                |
+| Field | Value |
+| --- | --- |
+| URL | `https://your-worker-domain/mcp` |
+| Authentication | **None** |
 
-Then **Add header**:
+Then **Add header**: name `x-api-key`, value your `MCP_TOKEN`, Required ticked.
 
-| Field       | Value                                                           |
-| ----------- | --------------------------------------------------------------- |
-| Header name | `x-api-key`                                                     |
-| Value       | Your `MCP_TOKEN` (or your UniFi key in bring-your-own-key mode) |
-| Required    | ✅                                                              |
-
-**Set Authentication to None, not OAuth.** This server uses an API key, not OAuth. The
-`authorization` header is greyed out because Claude reserves it for its own OAuth bearer
-token, which is why `x-api-key` is used instead.
+**Authentication must be None.** This server uses an API key, not OAuth. The
+`authorization` header is greyed out because Claude reserves it for its own OAuth
+token, hence `x-api-key`.
 
 ### Claude Code
 
-```
-claude mcp add --transport http unifi https://mcp-unifi.yourdomain.com/mcp \
+```bash
+claude mcp add --transport http unifi https://your-worker-domain/mcp \
   --header "x-api-key: YOUR_MCP_TOKEN"
 ```
 
 ### Clients that only speak stdio
 
-Some clients cannot talk to a remote server directly. Bridge with `mcp-remote`:
-
-```
+```json
 {
   "mcpServers": {
     "unifi": {
       "command": "npx",
       "args": [
         "-y", "mcp-remote",
-        "https://mcp-unifi.yourdomain.com/mcp",
+        "https://your-worker-domain/mcp",
         "--header", "x-api-key:YOUR_MCP_TOKEN"
       ]
     }
@@ -199,199 +148,136 @@ Some clients cannot talk to a remote server directly. Bridge with `mcp-remote`:
 }
 ```
 
-### If your client cannot set headers at all
-
-Put the token in the URL instead:
-
-```
-https://mcp-unifi.yourdomain.com/mcp/t/YOUR_MCP_TOKEN
-```
-
-This works, but the token then appears in your connector settings, in logs, and in any
-screenshot. Prefer the header where you can.
-
 ### Check it worked
 
-Ask your assistant: *"list my UniFi consoles"*. You should get your fleet back, with
-firmware and whether each one is reachable through the proxy. Then run `verify_console` on
-one of them before trusting anything else.
+Ask: *"list my UniFi consoles"*, then *"how is the fleet looking?"*
+
+**Adding tools requires a reconnect.** Tool lists are cached by the client at
+connection time, so after deploying a version with new tools, toggle the connector off
+and on before they appear.
 
 ---
 
 ## Tools
 
-### Reading
+### Fleet state
 
-| Tool             | What it does                                                                    |
-| ---------------- | ------------------------------------------------------------------------------- |
-| `list_consoles`  | Your fleet, with model, firmware and whether the Cloud Connector proxy works    |
-| `verify_console` | Checks one console properly and reports which config sections actually read     |
-| `get_config`     | One console's configuration, normalised for cross-console comparison            |
-| `diff_config`    | Compares a section across a batch of consoles against a baseline console        |
-| `raw_request`    | Any request the curated tools do not cover                                      |
+| Tool | What it does |
+| --- | --- |
+| `list_consoles` | Every console the key can reach, with model, firmware and connector capability |
+| `fleet_health` | Health across every site in one call, with a `needsAttention` list |
+| `get_health` | One site in detail: WAN availability and latency, ISP, clients, gateway CPU and memory |
+| `list_devices` | Devices on one console, with `onlyProblems` to surface just the unhappy ones |
+| `list_clients` | Clients with signal, retry rate and experience score, filterable to problems only |
+| `fleet_inventory` | Every device across every site as an asset register, grouped by model |
+| `firmware_report` | Pending updates fleet-wide, plus models running mixed versions across sites |
 
-Sections are `networks`, `wifi`, `firewall` and `dns`.
+### Configuration
 
-Run `verify_console` on an unfamiliar console before trusting a diff, rather than guessing.
-It reports firmware, sites and per-section success or the actual error.
+| Tool | What it does |
+| --- | --- |
+| `verify_console` | Whether a console is reachable and which config sections read cleanly |
+| `get_config` | Networks, WiFi, firewall or DNS from one console, normalised for comparison |
+| `diff_config` | Compare a section across sites against a baseline, reporting exactly what differs |
 
-`raw_request` paths are relative to the console's `/proxy` prefix, for example
-`/network/integration/v1/sites/{siteId}/acl-rules`. It is read only unless writes are
-enabled.
+### Escape hatch
 
-### Writing
+`raw_request` sends an arbitrary request through the Cloud Connector proxy for anything
+the curated tools do not cover. Read-only unless `ENABLE_WRITES` is set. Paths are
+validated to prevent escaping the console's `/proxy` prefix.
 
-Off by default. To enable, set the `ENABLE_WRITES` variable to `true` in **Settings** →
-**Variables and Secrets** (a plain variable, not a secret).
+### Writes
 
-`apply_config` brings a batch of consoles into line with a baseline console.
-
-When writes are off, this tool is not merely refused, it is not advertised at all.
-
-`apply_config` requires an explicit `confirm: true`. Without it you get the plan and
-nothing is changed, which is how you should always call it first.
-
-**Writing is not implemented in this version.** The dry run works and is useful on its own,
-but `confirm: true` returns an explicit refusal. The name-to-UUID reference resolver, the
-ordering pass for firewall policies and a per-console rollback path all have to land before
-this can safely touch a client network.
-
----
-
-## How it works
-
-### The baseline is a console, not a file
-
-There is no stored golden config. You nominate an existing console as the baseline and it
-is captured live. This keeps the Worker genuinely stateless, and it matches how this
-actually gets used: make the new site look like the one that already works.
-
-### Which UniFi API this uses
-
-Only the official Network Integration API (v10.4.57), reached through the Cloud Connector
-proxy. The classic controller API is not used anywhere, so there are no session cookies, no
-`meta`/`data` envelope and no undocumented field names.
-
-That API covers networks, WiFi broadcasts, firewall zones and policies, ACL rules, DNS
-policies and traffic matching lists, with full create, update and delete.
-
-### Fan-out is batched, on purpose
-
-Workers caps subrequests per request, at 50 on the free plan, and each proxied UniFi call
-adds roughly 800ms. A fleet-wide sweep in one tool call would blow through both limits.
-
-So `diff_config` and `apply_config` take an explicit list of console IDs, process
-`MAX_BATCH` of them, and return the rest in `remaining` for the next call. You get visible
-progress instead of a call that hangs and then fails at console 37.
-
-One console being offline does not lose the answer for the others. Failures come back in
-their own array with the reason.
-
-### What is normalised, and why
-
-Comparing raw UniFi payloads across consoles produces noise rather than drift. Three rules
-handle most of it.
-
-**Identity is by name, never by ID.** Every ID in this API is a UUID minted by one console,
-so a baseline keyed on IDs cannot be applied anywhere else. A firewall policy referencing a
-zone stores the zone's name, to be resolved back to a local UUID at apply time.
-
-**Only user-defined entities are compared.** Every policy and DNS record carries
-`metadata.origin`, and only `USER_DEFINED` entities can be modified. Stock and derived
-policies are dropped at capture, because reporting them as drift produces a change you
-cannot actually make.
-
-**Firewall policy order is relative.** The absolute `index` from a console depends on how
-many stock policies sit above it, and it is deprecated on write in any case. Ordering is
-applied through the dedicated ordering endpoint as a second phase.
-
-### Limits worth knowing
-
-Multi-site consoles are rejected with the site list rather than guessed at. Section reads
-take a single page of up to 200 entries and fail loudly if a console has more, rather than
-silently diffing a partial list.
+`apply_config` exists but **deliberately refuses to write**. Without name-to-UUID
+reference resolution, a firewall policy ordering pass and per-console rollback, applying
+config to a live client network is not safe. The dry run shows the plan. Enabling
+`ENABLE_WRITES` allows non-GET `raw_request` calls, not config application.
 
 ---
 
 ## Configuration reference
 
-| Name                  | Type     | Purpose                                                                                                 |
-| --------------------- | -------- | ------------------------------------------------------------------------------------------------------- |
-| `UNIFI_API_KEY`       | Secret   | Optional. Setting it switches to private mode                                                           |
-| `MCP_TOKEN`           | Secret   | Required when `UNIFI_API_KEY` is set. Accepts a comma separated list, so you can rotate without downtime |
-| `ALLOWED_CONSOLES`    | Secret   | Optional allowlist of console IDs, comma separated                                                      |
-| `ENABLE_WRITES`       | Variable | `true` registers the write tools                                                                        |
-| `MAX_BATCH`           | Variable | Consoles per fan-out call. Defaults to 6, capped at 12                                                  |
-| `UPSTREAM_TIMEOUT_MS` | Variable | Per upstream call. Defaults to 15000                                                                    |
+| Name | Type | Purpose |
+| --- | --- | --- |
+| `UNIFI_API_KEY` | Secret | Your Site Manager key. Omit to run in bring-your-own-key mode |
+| `MCP_TOKEN` | Secret | Required when `UNIFI_API_KEY` is set. Comma separated list accepted, for rotation |
+| `ALLOWED_CONSOLES` | Secret | Optional console ID allowlist |
+| `ENABLE_WRITES` | Variable | `true` allows non-GET `raw_request` |
+| `MAX_BATCH` | Variable | Upper bound on consoles per fan-out call. Default 6 |
+| `UPSTREAM_TIMEOUT_MS` | Variable | Per-call timeout. Default 15000 |
 
-### Rotating your token without breaking anything
+### Rotating your token without downtime
 
-`MCP_TOKEN` accepts a list. Set it to `old-token, new-token`, update each client one at a
-time, then set it back to just `new-token`. No downtime, no scramble.
+Set `MCP_TOKEN` to `old-token, new-token`, update each client, then set it back to just
+`new-token`.
 
 ### Accepted credential headers
 
 `x-api-key` is recommended, but `api-key`, `apikey`, `x-apikey`, `x-api-token`,
-`api-token`, `x-auth-token` and `Authorization: Bearer` all work, for clients that restrict
-which headers you can set.
+`api-token`, `x-auth-token` and `Authorization: Bearer` all work.
+
+---
+
+## How it works
+
+Config comes from the **Network Integration API**, the officially supported one. State
+comes from the **classic controller API**, which is still where health, devices and
+clients live. Both are reached through the Site Manager Cloud Connector proxy, so no
+VPN or open port is needed.
+
+**Everything reduces hard.** The raw device payload for a four-device site, or the
+client list for a small office, is large enough to exhaust an LLM context window on its
+own. No tool passes raw UniFi payloads through; each has a size guard that fails with a
+clear message rather than dumping.
+
+**Identity is by name, never by ID.** Every UUID in these APIs is minted by one console,
+so a config captured from one site cannot be matched to another by ID. Networks, zones
+and traffic lists are stored by name and resolved per console.
+
+**Subrequest budgeting.** Workers caps subrequests per request (50 on the free plan) and
+fan-out calls consume several per console. Batch sizes are computed from the cost of the
+section being read, and anything not processed comes back in `remaining` to feed into
+the next call rather than failing the whole request.
+
+**Failures are partial, not fatal.** One unreachable console never loses the answer for
+the rest. Consoles the cloud already reports as disconnected are listed separately under
+`offline`, with the time they went down, rather than reported as errors.
 
 ---
 
 ## Troubleshooting
 
-**`list_consoles` returns nothing, or only your own console.** Almost always the wrong key.
-The key from a console's Control Plane Integrations page is local to that console. You need
-the account-level key from unifi.ui.com under Settings, API Keys, generated from the
-organisation that administers the consoles.
+**401 from UniFi.** The key is wrong, expired, or was generated on a console rather than
+at unifi.ui.com. Test it directly:
 
-**A single console returns 403.** Key scoping. A personal key only reaches consoles
-belonging to its owner, so an organisation key is needed for other admins' consoles.
+```bash
+curl.exe -s -H "X-API-KEY: YOUR_KEY" https://api.ui.com/v1/hosts
+```
 
-**Every call returns 401 from the Worker.** Your header value does not match `MCP_TOKEN`.
-Check for a trailing space when you pasted it.
+**"UNIFI_API_KEY is not visible to the runtime."** The secret name does not match. The
+error lists every binding the Worker can see, so compare that list against the expected
+name.
 
-**The connector shows an OAuth sign-in prompt.** Authentication is set to something other
-than None. This server does not use OAuth.
+**A console returns 404 on everything.** Either it is offline, or the path does not
+exist on that version. `list_consoles` shows connection state. Not every classic API
+endpoint exists in every UniFi Network release: `stat/alarm` and `stat/event` are gone
+in 10.x, while `stat/health`, `stat/device` and `stat/sta` remain.
 
-**A console returns 404 for every section.** Either it is not visible to your key, or its
-firmware predates 5.0.3 and it has no Cloud Connector proxy. `verify_console` tells those
-two apart.
+**`firewall` fails but `networks` works.** That console has no zone-based firewalling
+configured. Networks still reads, but `zoneRef` will be null and the result carries a
+warning saying so.
 
-**A console times out but others in the batch are fine.** Proxied calls add roughly 800ms
-each, so a slow or flapping uplink can exceed `UPSTREAM_TIMEOUT_MS`. The console is
-reported as a failure and the rest of the batch still answers.
+**A WiFi diff shows everything as added and removed.** Identity is by name, so
+site-specific SSIDs like `Site_Priv` will not match across consoles. That is correct
+behaviour; diffs are most useful between sites built from a shared template.
 
-**Rate limited sooner than expected.** The documented Site Manager limit is 10,000 requests
-per minute, but the connector proxy is newer than the stable v1 endpoint list and may carry
-a lower limit. Reduce `MAX_BATCH`.
-
-**A write returns 403 while reads work.** Site Manager keys have historically been
-read-only, with write access something you enable and then regenerate the key for. Check
-the key's permissions at unifi.ui.com.
-
-**Results seem stale.** Console configuration is cached for 30 seconds and the fleet list
-for 60. On a `workers.dev` subdomain there is no caching at all.
-
----
-
-## Why another UniFi MCP
-
-Several UniFi MCP servers already exist and some are well built. They are all built around
-one controller at a time, which is the wrong shape for anyone running more than a handful
-of sites. This one differs in three ways:
-
-- **Fleet first.** One connection covers every console your key administers. The interesting
-question is not "what is on this gateway" but "where do my sites disagree with each other".
-- **Drift detection as a primitive.** Comparison happens in code, not by asking the model to
-eyeball two payloads, so the answer is deterministic and you can hand it to a client.
-- **Cloud proxy only.** No VPN, no port forward, no local network path required, which is
-what makes managing client sites practical.
+**New tools do not appear.** The client caches the tool list. Reconnect the connector.
 
 ---
 
 ## Development
 
-```
+```bash
 npm install
 npm run typecheck
 npm run dev     # needs a .dev.vars file, gitignored
@@ -403,13 +289,10 @@ npm run tail    # live logs from the deployed worker
 Free and MIT licensed. Provided as-is, with no warranty of any kind and no liability
 accepted, as set out in [LICENSE](LICENSE).
 
-You deploy and run this in your own Cloudflare account, so your API keys, your usage and
-anything the tools do to your UniFi consoles remain your responsibility. Enabling the write
-tools means an AI assistant can change configuration across every console your key
-administers, so read that section before turning them on.
-
-Unofficial. Not affiliated with, endorsed by or sponsored by Ubiquiti Inc. UniFi and
-Ubiquiti are trademarks of their respective owner.
+You deploy and run this in your own Cloudflare account, so your API key, your usage and
+anything the tools do to your UniFi estate remain your responsibility. This reaches
+production networks belonging to real clients: read the section on writes before
+enabling `ENABLE_WRITES`.
 
 Maintained in spare time, so issues and pull requests are very welcome but may not get a
 fast response.

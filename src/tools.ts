@@ -3,7 +3,7 @@ import { UnifiClient, UnifiError, MIN_CONNECTOR_FIRMWARE, type ConsoleSummary } 
 import { captureConfig, SECTIONS } from "./capture";
 import { diffSection, type ConsoleDiff } from "./diff";
 import { cachedJson } from "./cache";
-import { captureDevices, captureHealth, type DeviceState, type HealthState } from "./state";
+import { captureClients, captureDevices, captureHealth, type ClientState, type DeviceState, type HealthState } from "./state";
 import type { NormalisedConfig, SectionName } from "./normalise";
 
 export interface ToolDef {
@@ -132,7 +132,12 @@ async function fanOut<T>(
   consoleIds: string[],
   costPerConsole: number,
   job: (id: string, summary: ConsoleSummary) => Promise<T>,
-): Promise<{ results: T[]; failures: { consoleId: string; error: string }[]; remaining: string[] }> {
+): Promise<{
+  results: T[];
+  offline: { consoleId: string; name: string; since: string | null }[];
+  failures: { consoleId: string; error: string }[];
+  remaining: string[];
+}> {
   const index = await consoleIndex(ctx);
   const affordable = Math.max(1, Math.floor(SUBREQUEST_BUDGET / costPerConsole));
   const limit = Math.min(maxBatch(ctx.env) * 2, affordable);
@@ -140,8 +145,24 @@ async function fanOut<T>(
   const batch = consoleIds.slice(0, limit);
   const remaining = consoleIds.slice(limit);
 
+  /**
+   * A console the cloud already reports as disconnected is separated out before any
+   * request is attempted. It is not a failure, it is a fact worth reporting, and the
+   * proxy would otherwise spend a subrequest to return a 404 that reads like a bug.
+   */
+  const offline: { consoleId: string; name: string; since: string | null }[] = [];
+  const reachable: string[] = [];
+  for (const id of batch) {
+    const summary = index.get(id);
+    if (summary && !summary.online) {
+      offline.push({ consoleId: id, name: summary.name, since: summary.lastStateChange });
+    } else {
+      reachable.push(id);
+    }
+  }
+
   const settled = await Promise.allSettled(
-    batch.map(async (id) => {
+    reachable.map(async (id) => {
       const summary = index.get(id);
       if (!summary) throw new UnifiError(`Console ${id} is not visible to this API key.`, 404, id);
       if (!summary.connectorCapable) {
@@ -159,10 +180,10 @@ async function fanOut<T>(
   const failures: { consoleId: string; error: string }[] = [];
   settled.forEach((outcome, i) => {
     if (outcome.status === "fulfilled") results.push(outcome.value);
-    else failures.push({ consoleId: batch[i], error: String(outcome.reason?.message ?? outcome.reason) });
+    else failures.push({ consoleId: reachable[i], error: String(outcome.reason?.message ?? outcome.reason) });
   });
 
-  return { results, failures, remaining };
+  return { results, offline, failures, remaining };
 }
 
 const readTools: ToolDef[] = [
@@ -322,7 +343,7 @@ const readTools: ToolDef[] = [
         : [...index.keys()].filter((id) => !allow || allow.has(id));
       assertAllowed(ctx.env, ids);
 
-      const { results, failures, remaining } = await fanOut<HealthState>(
+      const { results, offline, failures, remaining } = await fanOut<HealthState>(
         ctx,
         ids,
         STATE_COST,
@@ -343,7 +364,8 @@ const readTools: ToolDef[] = [
 
       return {
         checked: results.length,
-        needsAttention: attention,
+        needsAttention: [...attention, ...offline.map((o) => `${o.name} (offline)`)],
+        offline,
         sites: results,
         failures,
         remaining,
@@ -399,7 +421,7 @@ const readTools: ToolDef[] = [
         : [...index.keys()].filter((id) => !allow || allow.has(id));
       assertAllowed(ctx.env, ids);
 
-      const { results, failures, remaining } = await fanOut(ctx, ids, STATE_COST, async (id, summary) => {
+      const { results, offline, failures, remaining } = await fanOut(ctx, ids, STATE_COST, async (id, summary) => {
         const devices = await cachedJson(ctx.apiKey, ["devices", id], 30, () =>
           captureDevices(ctx.client, id),
         );
@@ -432,11 +454,112 @@ const readTools: ToolDef[] = [
         sitesChecked: results.length,
         updatesPending: pending,
         modelsWithMixedVersions: versionSpread,
+        offline,
         failures,
         remaining,
         note: pending.length
           ? undefined
           : "No devices report a pending update across the consoles checked.",
+      };
+    },
+  },
+  {
+    name: "list_clients",
+    description:
+      "Clients connected to one console, with their network, SSID, signal strength, WiFi retry rate and experience score. Reduced from a payload that carries around fifty fields per client. Use onlyProblems to surface the clients actually having a bad time rather than reading the whole list.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        consoleId: { type: "string" },
+        onlyProblems: {
+          type: "boolean",
+          description:
+            "Return only clients with an experience score below 70, a signal weaker than -70dBm, or a WiFi retry rate above 20 percent.",
+        },
+        wirelessOnly: { type: "boolean", description: "Exclude wired clients." },
+      },
+      required: ["consoleId"],
+    },
+    handler: async (args, ctx) => {
+      assertAllowed(ctx.env, [args.consoleId]);
+      const clients = await cachedJson(ctx.apiKey, ["clients", args.consoleId], 30, () =>
+        captureClients(ctx.client, args.consoleId),
+      );
+
+      let list: ClientState[] = clients;
+      if (args.wirelessOnly) list = list.filter((c) => !c.wired);
+      if (args.onlyProblems) {
+        list = list.filter(
+          (c) =>
+            (c.satisfaction !== null && c.satisfaction < 70) ||
+            (c.signalDbm !== null && c.signalDbm < -70) ||
+            (c.txRetryPercent !== null && c.txRetryPercent > 20),
+        );
+      }
+
+      return {
+        count: list.length,
+        totalOnSite: clients.length,
+        wired: clients.filter((c) => c.wired).length,
+        wireless: clients.filter((c) => !c.wired).length,
+        guests: clients.filter((c) => c.guest).length,
+        clients: list,
+      };
+    },
+  },
+  {
+    name: "fleet_inventory",
+    description:
+      "Every device across every console in one call, as an asset register: site, name, model, firmware, adoption state and experience score. Use this for hardware audits, insurance schedules, or working out what is deployed where without opening each site.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        consoleIds: { type: "array", items: { type: "string" }, description: "Defaults to all." },
+      },
+    },
+    handler: async (args, ctx) => {
+      const index = await consoleIndex(ctx);
+      const allow = allowedConsoles(ctx.env);
+      const ids: string[] = args.consoleIds?.length
+        ? args.consoleIds
+        : [...index.keys()].filter((id) => !allow || allow.has(id));
+      assertAllowed(ctx.env, ids);
+
+      const { results, offline, failures, remaining } = await fanOut(ctx, ids, STATE_COST, async (id, summary) => {
+        const devices = await cachedJson(ctx.apiKey, ["devices", id], 30, () =>
+          captureDevices(ctx.client, id),
+        );
+        return { consoleName: summary.name, consoleModel: summary.model, devices };
+      });
+
+      const rows: Record<string, unknown>[] = [];
+      const modelCounts = new Map<string, number>();
+
+      for (const site of results) {
+        for (const d of site.devices as DeviceState[]) {
+          rows.push({
+            site: site.consoleName,
+            name: d.name,
+            model: d.model,
+            version: d.version,
+            mac: d.mac,
+            ipAddress: d.ipAddress,
+            adopted: d.adopted,
+            connected: d.connected,
+            satisfaction: d.satisfaction,
+          });
+          if (d.model) modelCounts.set(d.model, (modelCounts.get(d.model) ?? 0) + 1);
+        }
+      }
+
+      return {
+        totalDevices: rows.length,
+        sitesChecked: results.length,
+        byModel: Object.fromEntries([...modelCounts.entries()].sort((a, b) => b[1] - a[1])),
+        devices: rows,
+        offline,
+        failures,
+        remaining,
       };
     },
   },

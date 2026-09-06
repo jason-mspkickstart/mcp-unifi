@@ -110,8 +110,13 @@ function normaliseWans(uptimeStats: Record<string, any> | null | undefined): Wan
           : [],
       };
     })
-    // A WAN2 that has never been plugged in reports 0% availability forever, which reads
-    // as an outage. Kept, but ordered so the primary comes first.
+    /**
+     * A WAN port that has never carried traffic reports 0% availability and days of
+     * downtime forever. On a single-WAN site that is every secondary port, so leaving
+     * them in means four blocks of meaningless JSON per site and a false alarm on any
+     * check that looks at availability across all WANs.
+     */
+    .filter((wan) => wan.uptimeSeconds !== null || (wan.availabilityPercent ?? 0) > 0)
     .sort((a, b) => a.name.localeCompare(b.name));
 }
 
@@ -185,6 +190,68 @@ export async function captureHealth(
     },
     subsystems,
   };
+}
+
+export interface ClientState {
+  name: string;
+  mac: string | null;
+  ipAddress: string | null;
+  network: string | null;
+  wired: boolean;
+  guest: boolean;
+  ssid: string | null;
+  accessPoint: string | null;
+  band: string | null;
+  signalDbm: number | null;
+  /** UniFi's per-client experience score, 0 to 100. */
+  satisfaction: number | null;
+  /** Percentage of WiFi transmissions that needed retrying. Above ~20% is poor. */
+  txRetryPercent: number | null;
+  uptimeSeconds: number | null;
+}
+
+/** Radio codes as returned by the classic API. */
+const BANDS: Record<string, string> = { ng: "2.4GHz", na: "5GHz", "6e": "6GHz", ax: "5GHz" };
+
+export async function captureClients(
+  client: UnifiClient,
+  consoleId: string,
+): Promise<ClientState[]> {
+  const site = await resolveClassicSite(client, consoleId);
+  const payload = await client.proxy(consoleId, "GET", `${CLASSIC}/s/${site}/stat/sta`);
+
+  const size = JSON.stringify(payload).length;
+  if (size > MAX_RESPONSE_BYTES) {
+    throw new UnifiError(
+      `Console ${consoleId} returned ${Math.round(size / 1024)}KB of client data, above the ${Math.round(MAX_RESPONSE_BYTES / 1024)}KB guard. Too many clients to reduce safely in one call.`,
+      507,
+      consoleId,
+    );
+  }
+
+  const rows = UnifiClient.unwrap(payload) as Record<string, any>[];
+
+  return rows
+    .map((row) => {
+      const wired = row.is_wired === true;
+      return {
+        // Hostnames are often absent on IoT kit, so fall back to the vendor then the MAC.
+        name: String(row.name ?? row.hostname ?? row.oui ?? row.mac ?? "(unknown)"),
+        mac: row.mac ? String(row.mac) : null,
+        ipAddress: row.ip ?? row.last_ip ?? null,
+        network: row.network ?? row.last_connection_network_name ?? null,
+        wired,
+        guest: row.is_guest === true,
+        ssid: wired ? null : (row.essid ?? null),
+        accessPoint: row.last_uplink_name ?? null,
+        band: wired ? null : (BANDS[String(row.radio_proto ?? row.radio ?? "")] ?? null),
+        signalDbm: wired ? null : num(row.signal),
+        satisfaction: num(row.satisfaction),
+        txRetryPercent: wired ? null : num(row.wifi_tx_retries_percentage),
+        uptimeSeconds: num(row.uptime),
+      };
+    })
+    .sort((a, b) => a.name.localeCompare(b.name));
 }
 
 export async function captureDevices(

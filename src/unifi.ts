@@ -26,6 +26,8 @@ export interface ConsoleSummary {
   osVersion: string;
   ipAddress: string | null;
   online: boolean;
+  /** ISO timestamp of the last connect or disconnect, as reported by the cloud. */
+  lastStateChange: string | null;
   connectorCapable: boolean;
 }
 
@@ -50,7 +52,7 @@ function explain(status: number, body: string, consoleId?: string): string {
         : "The API key lacks permission for this call.";
     case 404:
       return consoleId
-        ? `Console ${consoleId} was not found, or its firmware predates ${MIN_CONNECTOR_FIRMWARE} and so has no Cloud Connector proxy. Run verify_console to tell those two apart.`
+        ? `Console ${consoleId} did not answer this path. Either the console is offline, or the path does not exist on it. Check list_consoles for its connection state; not every classic API endpoint exists in every UniFi Network version.`
         : "Endpoint not found. If this came from raw_request, check the path against developer.ui.com.";
     case 429:
       return "Rate limited by UniFi. Reduce the batch size or wait for the interval given in the Retry-After header.";
@@ -185,7 +187,11 @@ export class UnifiClient {
         model: String(reported.hardware?.shortname ?? reported.hardware?.name ?? "unknown"),
         osVersion,
         ipAddress: host.ipAddress ? String(host.ipAddress) : null,
-        online: reported.state === "connected" || host.isBlocked === false,
+        // Only the reported connection state means anything here. isBlocked is false on
+        // virtually every console, so including it made this true even for a console
+        // that had been off for twenty minutes.
+        online: reported.state === "connected",
+        lastStateChange: host.lastConnectionStateChange ? String(host.lastConnectionStateChange) : null,
         connectorCapable: compareVersions(osVersion, MIN_CONNECTOR_FIRMWARE) >= 0,
       };
     });
