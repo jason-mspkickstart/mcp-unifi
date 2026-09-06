@@ -1,0 +1,19 @@
+name = "mcp-unifi"
+main = "src/index.ts"
+compatibility_date = "2025-01-01"
+
+# Secrets are set in the Cloudflare dashboard, never here:
+#   UNIFI_API_KEY     optional. Omit to run in bring-your-own-key mode.
+#   MCP_TOKEN         required whenever UNIFI_API_KEY is set. Comma separated list for rotation.
+#   ALLOWED_CONSOLES  optional allowlist of console IDs. Kept as a secret so a public
+#                     repo does not advertise which clients are behind this deployment.
+[vars]
+ENABLE_WRITES = "false"
+
+# Fan-out batch size. Each console in a batch costs several subrequests, and Workers
+# caps subrequests per request (50 on the free plan), so this stays deliberately low.
+MAX_BATCH = "6"
+
+# Per-upstream-call timeout in milliseconds. Connector proxy calls take roughly 800ms,
+# so a slow console should be abandoned rather than stalling the whole batch.
+UPSTREAM_TIMEOUT_MS = "15000"

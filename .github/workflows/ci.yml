@@ -1,0 +1,21 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  typecheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      # npm install rather than npm ci, because there is no committed lockfile.
+      # .npmrc sets legacy-peer-deps, without which wrangler's optional peer dependency
+      # on @cloudflare/workers-types fails to resolve here.
+      - run: npm install
+      - run: npm run typecheck
