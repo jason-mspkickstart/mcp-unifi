@@ -61,6 +61,24 @@ export function authenticate(req: Request, env: Env, urlToken: string | null): A
   const presented = presentedCredential(req) ?? urlToken;
 
   if (!env.UNIFI_API_KEY) {
+    // MCP_TOKEN without UNIFI_API_KEY is almost always a binding that did not
+    // reach the runtime, not a deliberate choice to run open. Falling back to
+    // bring-your-own-key here would forward MCP_TOKEN to UniFi and produce an
+    // upstream 401 that looks exactly like a bad API key, which is impossible to
+    // diagnose from the outside. So say what is actually wrong instead.
+    if (env.MCP_TOKEN) {
+      const bindings = Object.keys(env).sort().join(", ") || "none";
+      return {
+        ok: false,
+        status: 500,
+        message:
+          "MCP_TOKEN is set but UNIFI_API_KEY is not visible to the runtime, so this deployment cannot use a server-held key. " +
+          `Bindings the Worker can currently see: ${bindings}. ` +
+          "If UNIFI_API_KEY is missing from that list, it was not applied: check it is a Secret rather than a Text variable, that the name has no trailing space, and redeploy. " +
+          "To run in bring-your-own-key mode instead, remove MCP_TOKEN.",
+      };
+    }
+
     if (!presented) {
       return {
         ok: false,
