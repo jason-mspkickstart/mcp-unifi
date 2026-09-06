@@ -12,10 +12,12 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "24"
 
       # npm install rather than npm ci, because there is no committed lockfile.
-      # .npmrc sets legacy-peer-deps, without which wrangler's optional peer dependency
-      # on @cloudflare/workers-types fails to resolve here.
+      # .npmrc sets legacy-peer-deps, which stops wrangler's peer dependency on
+      # @cloudflare/workers-types from failing to resolve. That does not install the
+      # package, so it is also an explicit devDependency: tsconfig names it in "types",
+      # and TS2688 is the error when it is missing.
       - run: npm install
       - run: npm run typecheck
