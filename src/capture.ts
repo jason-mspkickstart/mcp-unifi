@@ -22,6 +22,22 @@ export const SECTIONS: SectionName[] = ["networks", "wifi", "firewall", "dns"];
 const PAGE_LIMIT = 200;
 
 /**
+ * The list endpoint for networks returns a summary only: name, VLAN, enabled, zone and
+ * origin. Subnet, DHCP scope, isolation, mDNS forwarding and internet access exist only
+ * on GET /networks/{id}. Diffing the summary alone silently compares null against null
+ * and reports two sites as identical when their addressing differs completely, so each
+ * network is fetched individually.
+ *
+ * That costs one subrequest per network. Workers caps subrequests per request (50 on the
+ * free plan) and diff_config fans out across several consoles inside a single request, so
+ * the cap below is a real limit rather than a formality. Exceeding it fails loudly.
+ */
+const NETWORK_DETAIL_LIMIT = 25;
+
+/** Fetches network detail a few at a time: serial is slow enough to risk the timeout. */
+const DETAIL_CONCURRENCY = 4;
+
+/**
  * Fetches one paginated list endpoint. The envelope is
  * { offset, limit, count, totalCount, data }, and a single page covers any realistic
  * config object count, so this reads one page and reports if more exist rather than
@@ -48,6 +64,53 @@ async function listAll(
     );
   }
   return data;
+}
+
+/**
+ * Expands summary rows into full objects via their per-id endpoint.
+ *
+ * A network whose detail call fails is not silently downgraded to its summary, because
+ * that would reintroduce the null-versus-null comparison this exists to prevent. The
+ * whole capture fails instead, naming the network.
+ */
+async function fetchDetails(
+  client: UnifiClient,
+  consoleId: string,
+  base: string,
+  rows: Record<string, any>[],
+): Promise<Record<string, any>[]> {
+  if (rows.length > NETWORK_DETAIL_LIMIT) {
+    throw new UnifiError(
+      `Console ${consoleId} has ${rows.length} networks, above the ${NETWORK_DETAIL_LIMIT} this server will expand in one call. Each network costs a subrequest and Workers caps those per request. Diff a different section, or raise NETWORK_DETAIL_LIMIT and reduce MAX_BATCH together.`,
+      507,
+      consoleId,
+    );
+  }
+
+  const out: Record<string, any>[] = [];
+  for (let i = 0; i < rows.length; i += DETAIL_CONCURRENCY) {
+    const slice = rows.slice(i, i + DETAIL_CONCURRENCY);
+    const settled = await Promise.all(
+      slice.map(async (row) => {
+        if (!row.id) return row;
+        const detail = (await client.proxy(
+          consoleId,
+          "GET",
+          `${base}/networks/${encodeURIComponent(String(row.id))}`,
+        )) as Record<string, any> | null;
+        if (!detail) {
+          throw new UnifiError(
+            `Console ${consoleId} returned no detail for network "${row.name ?? row.id}".`,
+            502,
+            consoleId,
+          );
+        }
+        return detail;
+      }),
+    );
+    out.push(...settled);
+  }
+  return out;
 }
 
 /** Resolves the site to operate on. Errors rather than guessing when a console has several. */
@@ -84,14 +147,29 @@ export async function captureConfig(
   const siteId = await resolveSite(client, consoleId);
   const base = `${NET}/sites/${siteId}`;
 
-  // Networks and zones underpin the other sections: WiFi references a network, and every
-  // firewall policy endpoint references a zone. Both are fetched whenever anything needs
-  // to resolve a reference to a name.
-  const needsNetworks = sections.length > 0;
-  const needsZones = sections.includes("networks") || sections.includes("firewall");
+  const wantsNetworks = sections.includes("networks");
+  const wantsFirewall = sections.includes("firewall");
+  // WiFi resolves its bridged network to a name, so it needs the summary list too.
+  const needsNetworkList = wantsNetworks || wantsFirewall || sections.includes("wifi");
 
-  const networkRows = needsNetworks ? await listAll(client, consoleId, `${base}/networks`) : [];
-  const zoneRows = needsZones ? await listAll(client, consoleId, `${base}/firewall/zones`) : [];
+  const networkRows = needsNetworkList ? await listAll(client, consoleId, `${base}/networks`) : [];
+
+  /**
+   * Zones are enrichment for networks (a network gets its zone's name) but structural for
+   * firewall (there is nothing to report without them). A console without zone-based
+   * firewalling configured returns 400 here, which previously took the networks section
+   * down with it even though networks itself was perfectly readable.
+   */
+  let zoneRows: Record<string, any>[] = [];
+  let zoneError: string | null = null;
+  if (wantsNetworks || wantsFirewall) {
+    try {
+      zoneRows = await listAll(client, consoleId, `${base}/firewall/zones`);
+    } catch (err) {
+      zoneError = err instanceof Error ? err.message : String(err);
+      if (wantsFirewall) throw err;
+    }
+  }
 
   const networksById = new Map<string, string>();
   for (const n of networkRows) {
@@ -114,8 +192,16 @@ export async function captureConfig(
     sections: {},
   };
 
-  if (sections.includes("networks")) {
-    out.sections.networks = normaliseNetworks(networkRows, zonesById);
+  if (wantsNetworks) {
+    const detailed = await fetchDetails(client, consoleId, base, networkRows);
+    out.sections.networks = normaliseNetworks(detailed, zonesById);
+    if (zoneError) {
+      // Surfaced rather than swallowed: zoneRef will be null on every network, and a
+      // diff against a console that does have zones would otherwise look like real drift.
+      out.meta.warnings = [
+        `Firewall zones could not be read, so every network's zoneRef is null and zone drift cannot be detected. Cause: ${zoneError}`,
+      ];
+    }
   }
 
   if (sections.includes("wifi")) {
@@ -123,7 +209,7 @@ export async function captureConfig(
     out.sections.wifi = normaliseWifi(rows, networksById);
   }
 
-  if (sections.includes("firewall")) {
+  if (wantsFirewall) {
     const policies = await listAll(client, consoleId, `${base}/firewall/policies`);
     out.sections.firewall = normaliseFirewall(zoneRows, policies, networksById);
   }

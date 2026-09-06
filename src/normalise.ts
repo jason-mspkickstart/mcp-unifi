@@ -31,6 +31,8 @@ export interface ConfigMeta {
   osVersion: string;
   networkApiVersion: string | null;
   capturedAt: string;
+  /** Populated when part of a section could not be read and the result is degraded. */
+  warnings?: string[];
 }
 
 export interface DhcpConfig {

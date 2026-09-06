@@ -59,6 +59,37 @@ async function captureFor(ctx: Ctx, consoleId: string, sections: SectionName[]):
 }
 
 /**
+ * Rough subrequest cost per console, per section.
+ *
+ * Workers caps subrequests per request (50 on the free plan) and diff_config fans out
+ * across consoles inside a single request, so the batch size has to account for what each
+ * console actually costs. Networks is by far the most expensive because every network is
+ * fetched individually for its subnet and DHCP detail.
+ *
+ * Fixed overhead per console is roughly: site lookup, info, the section's list call.
+ */
+const SECTION_COST: Record<SectionName, number> = {
+  networks: 12, // site + info + list + zones + up to ~8 network detail calls
+  wifi: 4,
+  firewall: 5,
+  dns: 4,
+};
+
+/** Leaves headroom below the free plan's 50, since the count is an estimate. */
+const SUBREQUEST_BUDGET = 40;
+
+/**
+ * The configured MAX_BATCH is an upper bound, not a target. A networks diff across six
+ * consoles would blow the subrequest cap partway through and fail the whole call, which
+ * loses the answer for the consoles that had already succeeded.
+ */
+function effectiveBatch(env: Env, section: SectionName): number {
+  const configured = maxBatch(env);
+  const affordable = Math.max(1, Math.floor(SUBREQUEST_BUDGET / SECTION_COST[section]));
+  return Math.min(configured, affordable);
+}
+
+/**
  * Runs a per-console job across a capped batch and returns the leftovers rather than
  * carrying on. Workers limits subrequests per request, and each console costs several,
  * so an uncapped fan-out over a real fleet would hit that ceiling partway through and
@@ -67,9 +98,10 @@ async function captureFor(ctx: Ctx, consoleId: string, sections: SectionName[]):
 async function batched<T>(
   ctx: Ctx,
   consoleIds: string[],
+  section: SectionName,
   job: (id: string) => Promise<T>,
 ): Promise<{ results: T[]; failures: { consoleId: string; error: string }[]; remaining: string[] }> {
-  const limit = maxBatch(ctx.env);
+  const limit = effectiveBatch(ctx.env, section);
   const batch = consoleIds.slice(0, limit);
   const remaining = consoleIds.slice(limit);
 
@@ -182,7 +214,7 @@ const readTools: ToolDef[] = [
       const baseline = await captureFor(ctx, args.baselineConsoleId, [section]);
       const targets = (args.consoleIds as string[]).filter((id) => id !== args.baselineConsoleId);
 
-      const { results, failures, remaining } = await batched<ConsoleDiff>(ctx, targets, async (id) => {
+      const { results, failures, remaining } = await batched<ConsoleDiff>(ctx, targets, section, async (id) => {
         const target = await captureFor(ctx, id, [section]);
         return diffSection(baseline, target, section);
       });
@@ -253,7 +285,7 @@ const writeTools: ToolDef[] = [
       const baseline = await captureFor(ctx, args.baselineConsoleId, [section]);
       const targets = (args.consoleIds as string[]).filter((id) => id !== args.baselineConsoleId);
 
-      const { results, failures, remaining } = await batched(ctx, targets, async (id) => {
+      const { results, failures, remaining } = await batched(ctx, targets, section, async (id) => {
         const target = await captureFor(ctx, id, [section]);
         const d = diffSection(baseline, target, section);
         return { consoleId: id, changes: d.differences, inSync: d.inSync };
