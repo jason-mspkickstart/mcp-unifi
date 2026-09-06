@@ -148,7 +148,9 @@ function refNames(ids: unknown, lookup: Map<string, string>): string[] {
 
 export function normaliseNetworks(rows: unknown[], zonesById: Map<string, string>): NetworkSection[] {
   return (rows as Record<string, any>[])
-    .map((row) => {
+    // Annotated so the object literal is contextually typed. Without it, the mode
+    // ternary below widens to string and stops matching DhcpConfig's literal union.
+    .map((row): NetworkSection => {
       const v4 = row.ipv4Configuration ?? null;
       const d = v4?.dhcpConfiguration ?? null;
 
